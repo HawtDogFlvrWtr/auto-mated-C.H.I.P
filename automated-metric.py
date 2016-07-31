@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # OBD2 Loop routine for metrics
 # Created by Christopher Phipps (hawtdogflvrwtr@gmail.com)
-# 7/2626262626262626262626262626262626262626262626262626/2016
+# 7/12/2016
 #
 
 debugOn = False 
@@ -275,46 +275,41 @@ def mainFunction():
           time.sleep(2)
         outLog("here")
         tempPortName = scanPort[0]
-        connection = obd.Async(tempPortName)  # Auto connect to obd device
       portName = scanPort[0] 
       outLog('Connected to '+portName+' successfully')
+      connection = obd.Async(portName)  # Auto connect to obd device
+      connection.watch(obd.commands.RPM)
+      connection.start()
+      time.sleep(5)
     
       while engineStatus is False:
-        connection.watch(obd.commands.RPM)
-        connection.start()
-        time.sleep(5)
         outLog('Watching RPM to see if engine is running')
         checkEngineOn = connection.query(obd.commands.RPM)
-        outLog('Engine RPM: '+str(checkEngineOn.value))
         if checkEngineOn.is_null():  # Check if we have an RPM value.. if not return false
           outLog('Engine is not running, checking again')
           engineStatus = False
-          if not connection.is_connected():
-            break  # Break out of while and attempt to reconnect to the OBD port.. car is probably off!
-          connection.unwatch_all()
           time.sleep(5)
         else:
           dumpObd(connection, 1)
+          connection = obd.Async(portName)
+          outLog('Engine is started. Kicking off metrics loop..')
+          metricsArray = obdWatch(connection, acceptedMetrics)  # Watch all metrics
+          connection.start()  # Start async calls now that we're watching PID's
+          time.sleep(5)  # Wait for first metrics to come in.
+          if os.path.isfile('/opt/influxback'):  # Check for backup file and push it into the queue for upload.
+            outLog('Old metric data file found... Processing')
+            try:
+              with open('/opt/influxback') as f:
+                lines = f.readlines()
+              for line in lines:
+                outLog('Save data found importing...')
+                influxQueue.put(line)
+              os.remove('/opt/influxback')  # Kill file after we've dumped them all in the backup. 
+              outLog('Imported old metric data.')
+            except:
+              outLog('Failed while importing old queue')
           engineStatus = True
-
-      if engineStatus is True:
-        connection = obd.Async(portName)
-        outLog('Engine is started. Kicking off metrics loop..')
-        metricsArray = obdWatch(connection, acceptedMetrics)  # Watch all metrics
-        connection.start()  # Start async calls now that we're watching PID's
-        time.sleep(5)  # Wait for first metrics to come in.
-        if os.path.isfile('/opt/influxback'):  # Check for backup file and push it into the queue for upload.
-          outLog('Old metric data file found... Processing')
-          try:
-            with open('/opt/influxback') as f:
-              lines = f.readlines()
-            for line in lines:
-              outLog('Save data found importing...')
-              influxQueue.put(line)
-            os.remove('/opt/influxback')  # Kill file after we've dumped them all in the backup. 
-            outLog('Imported old metric data.')
-          except:
-            outLog('Failed while importing old queue')
+          break
   
         while engineStatus is True:
           try:
@@ -323,16 +318,12 @@ def mainFunction():
             for metricName in metricsArray:
               value = connection.query(obd.commands[metricName])
               metricDic.update({'time': currentTime})
+              # Skip empty values pulled by obd
               if value.value is not None:
                 metricDic.update({metricName: value.value})
             if metricDic.get('RPM') is None:  # Dump if RPM is none
               outLog("Engine has stopped. Dropping update")
               dumpObd(connection, 1)
-              for metric in metricDic:
-                if metric != 'time':
-                  metricDic.update({metric: 0})
-              influxQueue.put(json.dumps(metricDic))
-              engineStatus = False  # Kill while above
               if influxQueue.qsize() > 0 and networkStatus is False:
                 outLog('Engine off and network down. Saving queue to file.')
                 try:
@@ -343,10 +334,10 @@ def mainFunction():
                 except:
                   outLog('Failed writing queue to file.')
               break  # break from FOR if engine is no longer running
-            else: 
-              engineStatus = True  # Stay in While
           except:
-            outLog("Something happened while pulling metrics.. skipping")
+            outLog("Something happened while pulling metrics.. skipping this run")
+          engineStatus = False  # Kill while above
+          dumpObd(connection, 1)
           influxQueue.put(metricDic)  # Dump metrics to influx queue
           time.sleep(5)
     except:
@@ -361,9 +352,10 @@ def recordVideo():
           outLog("Attempting to start camera")
           capture = cv2.VideoCapture(0)
           capture.set(3,1280)
-          capture.set(4,960)
+          capture.set(4,720)
           fourcc = cv2.cv.CV_FOURCC('X', 'V', 'I', 'D')
-          video_writer = cv2.VideoWriter("/opt/"+currentDate+".avi", fourcc, 20, (1280, 960))
+          if capture.isOpened():
+            video_writer = cv2.VideoWriter("/opt/"+currentDate+".avi", fourcc, 20, (1280, 720))
           # record video
           while (capture.isOpened() and engineStatus is True):
             try:
